@@ -51,6 +51,7 @@
 #include "src/dawn/native/metal/PipelineLayoutMTL.h"
 #include "src/dawn/native/metal/QuerySetMTL.h"
 #include "src/dawn/native/metal/RenderPipelineMTL.h"
+#include "src/dawn/native/metal/ResourceTableMTL.h"
 #include "src/dawn/native/metal/SamplerMTL.h"
 #include "src/dawn/native/metal/TextureMTL.h"
 #include "src/dawn/native/metal/UtilsMetal.h"
@@ -521,6 +522,11 @@ struct StorageBufferLengthTracker {
         dataSize[SingleShaderStage::Compute] = sizeof(uint32_t) * bufferCount;
     }
 
+    void Invalidate() {
+        mLastImmediateCounts = 0;
+        dirtyStages = wgpu::ShaderStage::Compute;
+    }
+
     size_t mLastImmediateCounts = 0;
 };
 
@@ -547,6 +553,16 @@ template <typename T, typename EncoderType>
 class ImmediateTracker : public T {
   public:
     ImmediateTracker() = default;
+
+    void Invalidate() {
+        constexpr wgpu::ShaderStage stages =
+            kIsRenderImmediates ? wgpu::ShaderStage::Vertex | wgpu::ShaderStage::Fragment
+                                : wgpu::ShaderStage::Compute;
+        dirtyStages |= stages;
+        if (this->mLastPipeline != nullptr) {
+            this->mDirty = this->mLastPipeline->GetImmediateMask();
+        }
+    }
 
     // Applies immediates and buffer length data to the Metal command encoder.
     // This method uploads both immediate values and storage buffer lengths
@@ -681,6 +697,10 @@ class BindGroupTracker : public BindGroupTrackerBase<true> {
         : BindGroupTrackerBase(),
           mLengthTracker(lengthTracker),
           mUseArgumentBuffers(useArgumentBuffers) {}
+
+    void Invalidate() {
+        mLastAppliedPipeline = nullptr;
+    }
 
     template <typename Encoder>
     void Apply(Encoder encoder) {
@@ -1127,6 +1147,16 @@ MaybeError CommandBuffer::FillCommands(CommandRecordingContext* commandContext) 
                     DAWN_TRY(LazyClearSyncScope(scope, commandContext));
                 }
                 commandContext->EndBlit();
+                if (!resourceUsage.dispatchUsages.empty() &&
+                    resourceUsage.dispatchUsages[0].resourceTable) {
+                    auto writables = GatherWritableTextures(resourceUsage.dispatchUsages[0]);
+                    ResourceTable* table =
+                        ToBackend(resourceUsage.dispatchUsages[0].resourceTable);
+                    DAWN_TRY(table->ApplyPendingUpdates(commandContext, writables));
+                    commandContext->EndBlit();
+                    table->EncodeSync(commandContext);
+                    table->SetLastUsageSerial(GetDevice()->GetQueue()->GetPendingCommandSerial());
+                }
 
                 DAWN_TRY(EncodeComputePass(commandContext, cmd, resourceUsage));
 
@@ -1152,6 +1182,14 @@ MaybeError CommandBuffer::FillCommands(CommandRecordingContext* commandContext) 
                 }
                 DAWN_TRY(LazyClearSyncScope(resourceUsage, commandContext));
                 commandContext->EndBlit();
+                if (resourceUsage.resourceTable) {
+                    auto writables = GatherWritableTextures(resourceUsage);
+                    ResourceTable* table = ToBackend(resourceUsage.resourceTable);
+                    DAWN_TRY(table->ApplyPendingUpdates(commandContext, writables));
+                    commandContext->EndBlit();
+                    table->EncodeSync(commandContext);
+                    table->SetLastUsageSerial(GetDevice()->GetQueue()->GetPendingCommandSerial());
+                }
 
                 // Before beginning, we encode a compute pass that converts multi draws into an ICB
                 // if they exist.
@@ -1555,11 +1593,6 @@ MaybeError CommandBuffer::FillCommands(CommandRecordingContext* commandContext) 
                 break;
             }
 
-            case Command::SetResourceTable: {
-                // TODO(https://issues.chromium.org/473444514): Add support for resource tables.
-                return DAWN_UNIMPLEMENTED_ERROR("SetResourceTable unimplemented.");
-            }
-
             default:
                 DAWN_UNREACHABLE();
         }
@@ -1575,6 +1608,7 @@ MaybeError CommandBuffer::EncodeComputePass(CommandRecordingContext* commandCont
                                             const ComputePassResourceUsage& resourceUsage) {
     uint64_t currentDispatch = 0;
     ComputePipeline* lastPipeline = nullptr;
+    ResourceTable* currentResourceTable = nullptr;
     StorageBufferLengthTracker storageBufferLengths{GetDevice()};
     BindGroupTracker bindGroups(&storageBufferLengths,
                                 GetDevice()->IsToggleEnabled(Toggle::MetalUseArgumentBuffers));
@@ -1604,6 +1638,18 @@ MaybeError CommandBuffer::EncodeComputePass(CommandRecordingContext* commandCont
         }
     }
     SetDebugName(GetDevice(), encoder, "Dawn_ComputePassEncoder", computePassCmd->label);
+
+    auto ApplyResourceTableCompute = [&]() {
+        if (lastPipeline != nullptr && lastPipeline->GetLayout()->UsesResourceTable()) {
+            DAWN_ASSERT(currentResourceTable != nullptr);
+            id<MTLBuffer> tableBuf = currentResourceTable->GetTableBuffer();
+            id<MTLBuffer> metaBuf = currentResourceTable->GetMetadataBuffer();
+            [encoder setBuffer:tableBuf offset:0 atIndex:kResourceTableBufferSlot];
+            [encoder setBuffer:metaBuf offset:0 atIndex:kResourceTableMetadataBufferSlot];
+            currentResourceTable->MakeResourcesResident(encoder);
+            currentResourceTable->SetLastUsageSerial(GetDevice()->GetQueue()->GetPendingCommandSerial());
+        }
+    };
 
     Command type;
     ImmediateTracker<ComputeImmediatesTracker, id<MTLComputeCommandEncoder>> immediates = {};
@@ -1637,12 +1683,36 @@ MaybeError CommandBuffer::EncodeComputePass(CommandRecordingContext* commandCont
 
                 // Skip noop dispatches, it can causes issues on some systems.
                 if (dispatch->x == 0 || dispatch->y == 0 || dispatch->z == 0) {
+                    currentDispatch++;
                     break;
+                }
+
+                if (currentDispatch > 0 &&
+                    currentDispatch < resourceUsage.dispatchUsages.size() &&
+                    resourceUsage.dispatchUsages[currentDispatch].resourceTable) {
+                    const auto& scope = resourceUsage.dispatchUsages[currentDispatch];
+                    auto writables = GatherWritableTextures(scope);
+                    commandContext->EndCompute();
+                    ResourceTable* table = ToBackend(scope.resourceTable);
+                    DAWN_TRY(table->ApplyPendingUpdates(commandContext, writables));
+                    commandContext->EndBlit();
+                    table->EncodeSync(commandContext);
+                    table->SetLastUsageSerial(GetDevice()->GetQueue()->GetPendingCommandSerial());
+                    encoder = commandContext->BeginCompute();
+                    SetDebugName(GetDevice(), encoder, "Dawn_ComputePassEncoder",
+                                 computePassCmd->label);
+                    if (lastPipeline) {
+                        lastPipeline->Encode(encoder);
+                    }
+                    bindGroups.Invalidate();
+                    storageBufferLengths.Invalidate();
+                    immediates.Invalidate();
                 }
 
                 bindGroups.Apply(encoder);
                 storageBufferLengths.Apply(lastPipeline);
                 immediates.Apply(encoder, &storageBufferLengths);
+                ApplyResourceTableCompute();
                 MetalComputePassMakeResourcesResident(
                     GetDevice(), encoder, resourceUsage.dispatchUsages[currentDispatch]);
 
@@ -1655,9 +1725,32 @@ MaybeError CommandBuffer::EncodeComputePass(CommandRecordingContext* commandCont
             case Command::DispatchIndirect: {
                 DispatchIndirectCmd* dispatch = mCommands.NextCommand<DispatchIndirectCmd>();
 
+                if (currentDispatch > 0 &&
+                    currentDispatch < resourceUsage.dispatchUsages.size() &&
+                    resourceUsage.dispatchUsages[currentDispatch].resourceTable) {
+                    const auto& scope = resourceUsage.dispatchUsages[currentDispatch];
+                    auto writables = GatherWritableTextures(scope);
+                    commandContext->EndCompute();
+                    ResourceTable* table = ToBackend(scope.resourceTable);
+                    DAWN_TRY(table->ApplyPendingUpdates(commandContext, writables));
+                    commandContext->EndBlit();
+                    table->EncodeSync(commandContext);
+                    table->SetLastUsageSerial(GetDevice()->GetQueue()->GetPendingCommandSerial());
+                    encoder = commandContext->BeginCompute();
+                    SetDebugName(GetDevice(), encoder, "Dawn_ComputePassEncoder",
+                                 computePassCmd->label);
+                    if (lastPipeline) {
+                        lastPipeline->Encode(encoder);
+                    }
+                    bindGroups.Invalidate();
+                    storageBufferLengths.Invalidate();
+                    immediates.Invalidate();
+                }
+
                 bindGroups.Apply(encoder);
                 storageBufferLengths.Apply(lastPipeline);
                 immediates.Apply(encoder, &storageBufferLengths);
+                ApplyResourceTableCompute();
                 MetalComputePassMakeResourcesResident(
                     GetDevice(), encoder, resourceUsage.dispatchUsages[currentDispatch]);
 
@@ -1737,6 +1830,12 @@ MaybeError CommandBuffer::EncodeComputePass(CommandRecordingContext* commandCont
                 break;
             }
 
+            case Command::SetResourceTable: {
+                SetResourceTableCmd* cmd = mCommands.NextCommand<SetResourceTableCmd>();
+                currentResourceTable = ToBackend(cmd->table.Get());
+                break;
+            }
+
             default: {
                 DAWN_UNREACHABLE();
                 break;
@@ -1756,11 +1855,26 @@ MaybeError CommandBuffer::EncodeRenderPass(
     PassIndex renderPassIndex) {
     bool enableVertexPulling = GetDevice()->IsToggleEnabled(Toggle::MetalEnableVertexPulling);
     RenderPipeline* lastPipeline = nullptr;
+    ResourceTable* currentResourceTable = nullptr;
     id<MTLBuffer> indexBuffer = nullptr;
     size_t indexBufferBaseOffset = 0;
     MTLIndexType indexBufferType;
     uint64_t indexFormatSize = 0;
     uint32_t multiDrawIndex = 0;
+
+    auto ApplyResourceTableRender = [&]() {
+        if (lastPipeline != nullptr && lastPipeline->GetLayout()->UsesResourceTable()) {
+            DAWN_ASSERT(currentResourceTable != nullptr);
+            id<MTLBuffer> tableBuf = currentResourceTable->GetTableBuffer();
+            id<MTLBuffer> metaBuf = currentResourceTable->GetMetadataBuffer();
+            [encoder setVertexBuffer:tableBuf offset:0 atIndex:kResourceTableBufferSlot];
+            [encoder setFragmentBuffer:tableBuf offset:0 atIndex:kResourceTableBufferSlot];
+            [encoder setVertexBuffer:metaBuf offset:0 atIndex:kResourceTableMetadataBufferSlot];
+            [encoder setFragmentBuffer:metaBuf offset:0 atIndex:kResourceTableMetadataBufferSlot];
+            currentResourceTable->MakeResourcesResident(encoder);
+            currentResourceTable->SetLastUsageSerial(GetDevice()->GetQueue()->GetPendingCommandSerial());
+        }
+    };
 
     bool didDrawInCurrentOcclusionQuery = false;
 
@@ -1802,6 +1916,7 @@ MaybeError CommandBuffer::EncodeRenderPass(
                 bindGroups.Apply(encoder);
                 storageBufferLengths.Apply(lastPipeline, enableVertexPulling);
                 immediates.Apply(encoder, &storageBufferLengths);
+                ApplyResourceTableRender();
 
                 // The instance count must be non-zero, otherwise no-op
                 if (draw->instanceCount != 0) {
@@ -1831,6 +1946,7 @@ MaybeError CommandBuffer::EncodeRenderPass(
                 bindGroups.Apply(encoder);
                 storageBufferLengths.Apply(lastPipeline, enableVertexPulling);
                 immediates.Apply(encoder, &storageBufferLengths);
+                ApplyResourceTableRender();
 
                 // The index and instance count must be non-zero, otherwise no-op
                 if (draw->indexCount != 0 && draw->instanceCount != 0) {
@@ -1868,6 +1984,7 @@ MaybeError CommandBuffer::EncodeRenderPass(
                 bindGroups.Apply(encoder);
                 storageBufferLengths.Apply(lastPipeline, enableVertexPulling);
                 immediates.Apply(encoder, &storageBufferLengths);
+                ApplyResourceTableRender();
 
                 IndirectDrawMetadata::ValidatedIndirectDraw validatedDraw =
                     metadata.GetValidatedIndirectDraw(draw, indirectDrawIndex++);
@@ -1891,6 +2008,7 @@ MaybeError CommandBuffer::EncodeRenderPass(
                 bindGroups.Apply(encoder);
                 storageBufferLengths.Apply(lastPipeline, enableVertexPulling);
                 immediates.Apply(encoder, &storageBufferLengths);
+                ApplyResourceTableRender();
 
                 IndirectDrawMetadata::ValidatedIndirectDraw validatedDraw =
                     metadata.GetValidatedIndirectDraw(draw, indirectDrawIndex++);
@@ -1917,6 +2035,7 @@ MaybeError CommandBuffer::EncodeRenderPass(
                 bindGroups.Apply(encoder);
                 storageBufferLengths.Apply(lastPipeline, enableVertexPulling);
                 immediates.Apply(encoder, &storageBufferLengths);
+                ApplyResourceTableRender();
 
                 ExecuteMultiDraw(multiDrawExecutions[multiDrawIndex], encoder);
                 multiDrawIndex++;
@@ -1929,6 +2048,7 @@ MaybeError CommandBuffer::EncodeRenderPass(
                 bindGroups.Apply(encoder);
                 storageBufferLengths.Apply(lastPipeline, enableVertexPulling);
                 immediates.Apply(encoder, &storageBufferLengths);
+                ApplyResourceTableRender();
 
                 ExecuteMultiDraw(multiDrawExecutions[multiDrawIndex], encoder);
                 multiDrawIndex++;
@@ -2023,6 +2143,12 @@ MaybeError CommandBuffer::EncodeRenderPass(
 
                 vertexBuffers.OnSetVertexBuffer(cmd->slot, ToBackend(cmd->buffer.Get()),
                                                 cmd->offset);
+                break;
+            }
+
+            case Command::SetResourceTable: {
+                SetResourceTableCmd* cmd = iter->NextCommand<SetResourceTableCmd>();
+                currentResourceTable = ToBackend(cmd->table.Get());
                 break;
             }
 

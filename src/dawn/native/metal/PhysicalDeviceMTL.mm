@@ -816,6 +816,10 @@ void PhysicalDevice::InitializeSupportedFeaturesImpl() {
     if ([*mDevice readWriteTextureSupport] == MTLReadWriteTextureTier2) {
         EnableFeature(Feature::TextureFormatsTier2);
     }
+
+    if ([*mDevice argumentBuffersSupport] >= MTLArgumentBuffersTier2) {
+        EnableFeature(Feature::ChromiumExperimentalSamplingResourceTable);
+    }
 }
 
 void PhysicalDevice::InitializeVendorArchitectureImpl() {

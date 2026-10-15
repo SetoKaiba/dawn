@@ -37,6 +37,7 @@
 #include "src/dawn/native/Adapter.h"
 #include "src/dawn/native/BindGroupLayout.h"
 #include "src/dawn/native/CacheRequest.h"
+#include "src/dawn/native/ResourceTableDefaultResources.h"
 #include "src/dawn/native/Serializable.h"
 #include "src/dawn/native/TintUtils.h"
 #include "src/dawn/native/metal/BindGroupLayoutMTL.h"
@@ -225,20 +226,34 @@ ResultOrUnknownError<CacheResult<MslCompilation>> TranslateToMSL(
     const ImmediateMask& pipelineImmediateMask) {
     bool useArgumentBuffers = device->IsToggleEnabled(Toggle::MetalUseArgumentBuffers);
 
-    tint::Bindings bindings =
-        GenerateBindingRemapping(layout, stage, [&](BindGroupIndex group, BindingIndex index) {
-            if (useArgumentBuffers) {
-                return tint::BindingPoint{
-                    .group = uint32_t{group},
-                    .binding = ToMTLArgumentBufferIndex(index),
-                };
-            } else {
-                return tint::BindingPoint{
-                    .group = 0,
-                    .binding = layout->GetBindingIndexInfo(stage)[group][index],
-                };
-            }
-        });
+    auto ToMTLBindPoint = [&](BindGroupIndex group, BindingIndex index) -> tint::BindingPoint {
+        if (useArgumentBuffers) {
+            return tint::BindingPoint{
+                .group = uint32_t{group},
+                .binding = ToMTLArgumentBufferIndex(index),
+            };
+        } else {
+            return tint::BindingPoint{
+                .group = 0,
+                .binding = layout->GetBindingIndexInfo(stage)[group][index],
+            };
+        }
+    };
+
+    tint::Bindings bindings = GenerateBindingRemapping(layout, stage, ToMTLBindPoint);
+
+    std::optional<tint::ResourceTableConfig> resourceTableConfig = std::nullopt;
+    if (layout->UsesResourceTable()) {
+        auto binding_to_resource_type = GenerateBindingToResourceType(layout, ToMTLBindPoint);
+        auto bindingTypeOrder = ResourceTableDefaultResources::GetOrder();
+        resourceTableConfig = tint::ResourceTableConfig{
+            .resource_table_binding = tint::BindingPoint(0, kResourceTableBufferSlot),
+            .storage_buffer_binding = tint::BindingPoint(0, kResourceTableMetadataBufferSlot),
+            .default_binding_type_order = {bindingTypeOrder.begin(), bindingTypeOrder.end()},
+            .get_sampler_index_from_metadata = false,
+            .binding_to_resource_type = std::move(binding_to_resource_type),
+        };
+    }
 
     tint::msl::writer::ArrayLengthOptions arrayLengthFromConstants =
         GenerateArrayLengthOptions(layout, stage);
@@ -343,6 +358,7 @@ ResultOrUnknownError<CacheResult<MslCompilation>> TranslateToMSL(
 
     req.tintOptions.use_argument_buffers = useArgumentBuffers;
     req.tintOptions.group_to_argument_buffer_info = std::move(argumentBufferInfo);
+    req.tintOptions.resource_table = std::move(resourceTableConfig);
 
     req.tintOptions.workarounds.scalarize_max_min_clamp =
         device->IsToggleEnabled(Toggle::ScalarizeMaxMinClamp);

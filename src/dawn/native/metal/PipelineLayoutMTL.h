@@ -45,11 +45,14 @@ class Device;
 inline constexpr size_t kMetalBufferTableSize = 31;
 // Immediate blocks contain pipeline immediates followed by tightly packed storage buffer sizes.
 inline constexpr size_t kImmediateBlockBufferSlot = kMetalBufferTableSize - 1;
+// ResourceTable buffer slots:
+inline constexpr size_t kResourceTableMetadataBufferSlot = kImmediateBlockBufferSlot - 1;
+inline constexpr size_t kResourceTableBufferSlot = kResourceTableMetadataBufferSlot - 1;
 // The number of Metal buffers Dawn can use in a generic way (i.e. that aren't reserved)
-inline constexpr size_t kGenericMetalBufferSlots = kMetalBufferTableSize - 1;
+inline constexpr size_t kGenericMetalBufferSlots = kResourceTableBufferSlot;
 
 // The Last buffer slot to be used by argument buffers
-inline constexpr size_t kArgumentBufferSlotMax = kImmediateBlockBufferSlot - 1;
+inline constexpr size_t kArgumentBufferSlotMax = kResourceTableBufferSlot - 1;
 
 inline uint32_t GetImmediateBufferSizesByteOffset(ImmediateMask pipelineImmediateMask) {
     return static_cast<uint32_t>(pipelineImmediateMask.count()) * kImmediateElementByteSize;

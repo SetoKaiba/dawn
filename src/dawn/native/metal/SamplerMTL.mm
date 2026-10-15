@@ -96,7 +96,8 @@ MaybeError Sampler::Initialize(const SamplerDescriptor* descriptor) {
 
     NSRef<NSString> label = MakeDebugName(GetDevice(), "Dawn_Sampler", GetLabel());
     mtlDesc.label = label.Get();
-    if (GetDevice()->IsToggleEnabled(Toggle::MetalUseArgumentBuffers)) {
+    if (GetDevice()->HasFeature(Feature::ChromiumExperimentalSamplingResourceTable) ||
+        GetDevice()->IsToggleEnabled(Toggle::MetalUseArgumentBuffers)) {
         mtlDesc.supportArgumentBuffers = true;
     }
 
